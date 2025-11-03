@@ -10,10 +10,10 @@
     .toolbar { display: flex; gap: 12px; align-items: center; margin-bottom: 10px; }
     .toolbar button, .toolbar input[type=range] { padding: 8px; }
     .stage { position: relative; border: 1px solid #333; background: #000; }
-    .stage img { display: block; width: 100%; height: auto; user-select: none; pointer-events: none; }
-    svg { position: absolute; left: 0; top: 0; width: 100%; height: 100%; }
+    .stage img { display: block; width: 100%; height: auto; user-select: none; pointer-events: none; -webkit-user-drag: none; }
+    svg { position: absolute; left: 0; top: 0; width: 100%; height: 100%; touch-action: none; -ms-touch-action: none; -webkit-user-select: none; user-select: none; -webkit-touch-callout: none; }
     .ref { stroke: #00c7ff; stroke-width: 2; fill: none; opacity: 0.3; }
-    .user { stroke: #ffd400; stroke-width: 3; fill: none; }
+    .user { stroke: #ffd400; stroke-width: 3; fill: none; stroke-linecap: round; stroke-linejoin: round; }
     .heat { stroke: rgba(255,80,80,0.7); stroke-width: 2; fill: none; }
     .score { font-size: 18px; margin-top: 8px; }
     .hint { font-size: 13px; color: #aaa; }
@@ -68,10 +68,14 @@
   let drawing = false;
   let points = [];
 
+  // Accept pointer event or touch event
   const toSVGPoint = (evt) => {
+    // support pointer events and touch events
+    const clientX = (evt.clientX !== undefined) ? evt.clientX : (evt.touches && evt.touches[0] && evt.touches[0].clientX);
+    const clientY = (evt.clientY !== undefined) ? evt.clientY : (evt.touches && evt.touches[0] && evt.touches[0].clientY);
     const rect = svg.getBoundingClientRect();
-    const x = (evt.clientX - rect.left) * (svg.viewBox.baseVal.width / rect.width);
-    const y = (evt.clientY - rect.top) * (svg.viewBox.baseVal.height / rect.height);
+    const x = (clientX - rect.left) * (svg.viewBox.baseVal.width / rect.width);
+    const y = (clientY - rect.top) * (svg.viewBox.baseVal.height / rect.height);
     return {x, y};
   };
 
@@ -84,16 +88,22 @@
     return d;
   };
 
-  // Pointer events for freehand tracing
-  svg.addEventListener('pointerdown', (e) => {
+  // Drawing helpers (extracted to reuse for pointer + touch)
+  function startDraw(e) {
+    // stop browser default (page scroll / pan) when starting draw
+    if (e.cancelable) e.preventDefault();
     drawing = true; points = [];
     const p = toSVGPoint(e); points.push(p);
     user.setAttribute('d', ptsToPathD(points));
     user.style.strokeWidth = strokeSlider.value;
-    svg.setPointerCapture(e.pointerId);
-  });
-  svg.addEventListener('pointermove', (e) => {
+    // try to capture pointer if available
+    if (e.pointerId) {
+      try { svg.setPointerCapture(e.pointerId); } catch(_) {}
+    }
+  }
+  function moveDraw(e) {
     if (!drawing) return;
+    if (e.cancelable) e.preventDefault();
     const p = toSVGPoint(e);
     const last = points[points.length-1];
     // Throttle points to avoid huge arrays
@@ -101,12 +111,30 @@
       points.push(p);
       user.setAttribute('d', ptsToPathD(points));
     }
-  });
-  svg.addEventListener('pointerup', (e) => {
+  }
+  function endDraw(e) {
+    if (e && e.cancelable) e.preventDefault();
     drawing = false;
-    svg.releasePointerCapture(e.pointerId);
-  });
-  svg.addEventListener('pointerleave', () => { drawing = false; });
+    if (e && e.pointerId) {
+      try { svg.releasePointerCapture(e.pointerId); } catch(_) {}
+    }
+  }
+
+  // Pointer events (modern browsers)
+  svg.addEventListener('pointerdown', startDraw, { passive: false });
+  svg.addEventListener('pointermove', moveDraw, { passive: false });
+  svg.addEventListener('pointerup', endDraw, { passive: false });
+  svg.addEventListener('pointercancel', endDraw, { passive: false });
+  svg.addEventListener('pointerleave', endDraw, { passive: false });
+
+  // Touch fallback for browsers that don't fully support pointer events (older iOS)
+  svg.addEventListener('touchstart', startDraw, { passive: false });
+  svg.addEventListener('touchmove', moveDraw, { passive: false });
+  svg.addEventListener('touchend', endDraw, { passive: false });
+  svg.addEventListener('touchcancel', endDraw, { passive: false });
+
+  // Prevent double-tap-to-zoom interfering when drawing fast on iOS
+  svg.addEventListener('gesturestart', (e) => { if (e.cancelable) e.preventDefault(); }, { passive: false });
 
   clearBtn.addEventListener('click', () => {
     points = [];
