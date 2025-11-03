@@ -1,0 +1,205 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>Trace & Score</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <style>
+    body { font-family: system-ui, Arial, sans-serif; margin: 0; background: #111; color: #eee; }
+    .wrap { max-width: 900px; margin: 0 auto; padding: 16px; }
+    .toolbar { display: flex; gap: 12px; align-items: center; margin-bottom: 10px; }
+    .toolbar button, .toolbar input[type=range] { padding: 8px; }
+    .stage { position: relative; border: 1px solid #333; background: #000; }
+    .stage img { display: block; width: 100%; height: auto; user-select: none; pointer-events: none; }
+    svg { position: absolute; left: 0; top: 0; width: 100%; height: 100%; }
+    .ref { stroke: #00c7ff; stroke-width: 2; fill: none; opacity: 0.3; }
+    .user { stroke: #ffd400; stroke-width: 3; fill: none; }
+    .heat { stroke: rgba(255,80,80,0.7); stroke-width: 2; fill: none; }
+    .score { font-size: 18px; margin-top: 8px; }
+    .hint { font-size: 13px; color: #aaa; }
+  </style>
+</head>
+<body>
+<div class="wrap">
+  <h1>Trace & Score</h1>
+  <div class="toolbar">
+    <button id="clearBtn">Clear</button>
+    <button id="finishBtn">Finish & Score</button>
+    <label>Stroke
+      <input id="strokeWidth" type="range" min="2" max="12" value="3" />
+    </label>
+    <span class="hint">Draw over the image. Click “Finish & Score”.</span>
+  </div>
+
+  <div class="stage" id="stage">
+    <img id="baseImg" src="https://indicalab.com/wp-content/uploads/2024/06/NSCLC-IHC-Tumor-Tissue-Detection-Non-Markup2_lowres.jpg" alt="Base" />
+    <svg id="svgLayer" viewBox="0 0 800 600" preserveAspectRatio="xMidYMid meet">
+      <!-- Replace this with your ground-truth path “d” -->
+      <path id="refPath" class="ref"
+            d="M 200 300 C 250 200 350 200 400 300 C 450 400 350 450 300 400 C 260 360 240 340 200 300 Z" />
+      <path id="userPath" class="user" d="" />
+      <path id="heatPath" class="heat" d="" />
+    </svg>
+  </div>
+
+  <div class="score" id="scoreBox">Score: —</div>
+</div>
+
+<script>
+(function(){
+  const svg = document.getElementById('svgLayer');
+  const ref = document.getElementById('refPath');
+  const user = document.getElementById('userPath');
+  const heat = document.getElementById('heatPath');
+  const clearBtn = document.getElementById('clearBtn');
+  const finishBtn = document.getElementById('finishBtn');
+  const strokeSlider = document.getElementById('strokeWidth');
+  const scoreBox = document.getElementById('scoreBox');
+  const img = document.getElementById('baseImg');
+
+  // Keep SVG viewBox aligned with image size
+  img.addEventListener('load', () => {
+    const w = img.naturalWidth || img.clientWidth;
+    const h = img.naturalHeight || img.clientHeight;
+    svg.setAttribute('viewBox', `0 0 ${w} ${h}`);
+  });
+
+  // Drawing state
+  let drawing = false;
+  let points = [];
+
+  const toSVGPoint = (evt) => {
+    const rect = svg.getBoundingClientRect();
+    const x = (evt.clientX - rect.left) * (svg.viewBox.baseVal.width / rect.width);
+    const y = (evt.clientY - rect.top) * (svg.viewBox.baseVal.height / rect.height);
+    return {x, y};
+  };
+
+  const ptsToPathD = (pts) => {
+    if (!pts.length) return '';
+    let d = `M ${pts[0].x} ${pts[0].y}`;
+    for (let i=1;i<pts.length;i++){
+      d += ` L ${pts[i].x} ${pts[i].y}`;
+    }
+    return d;
+  };
+
+  // Pointer events for freehand tracing
+  svg.addEventListener('pointerdown', (e) => {
+    drawing = true; points = [];
+    const p = toSVGPoint(e); points.push(p);
+    user.setAttribute('d', ptsToPathD(points));
+    user.style.strokeWidth = strokeSlider.value;
+    svg.setPointerCapture(e.pointerId);
+  });
+  svg.addEventListener('pointermove', (e) => {
+    if (!drawing) return;
+    const p = toSVGPoint(e);
+    const last = points[points.length-1];
+    // Throttle points to avoid huge arrays
+    if (!last || Math.hypot(p.x-last.x, p.y-last.y) > 1.5) {
+      points.push(p);
+      user.setAttribute('d', ptsToPathD(points));
+    }
+  });
+  svg.addEventListener('pointerup', (e) => {
+    drawing = false;
+    svg.releasePointerCapture(e.pointerId);
+  });
+  svg.addEventListener('pointerleave', () => { drawing = false; });
+
+  clearBtn.addEventListener('click', () => {
+    points = [];
+    user.setAttribute('d','');
+    heat.setAttribute('d','');
+    scoreBox.textContent = 'Score: —';
+  });
+
+  finishBtn.addEventListener('click', () => {
+    if (points.length < 2) {
+      scoreBox.textContent = 'Score: Draw a path first.';
+      return;
+    }
+    const refSamples = samplePath(ref, 200);
+    const userSamples = resamplePolyline(points, 200);
+
+    const {avgErr, maxErr, heatPolyline} = bidirectionalError(refSamples, userSamples);
+    const pxTolerance = 6;   // adjust based on image scale
+    const pxMax = 40;        // cap for scoring
+    const score = toScore(avgErr, pxTolerance, pxMax);
+
+    heat.setAttribute('d', ptsToPathD(heatPolyline));
+    scoreBox.textContent = `Score: ${Math.round(score)} / 100  (avg error ${avgErr.toFixed(1)} px)`;
+  });
+
+  function toScore(avgErr, tol, maxCap){
+    // Map average error to 0–100, with full score at tol, tapering to 0 at maxCap
+    if (avgErr <= tol) return 100;
+    const x = Math.min(avgErr, maxCap);
+    const t = (x - tol) / (maxCap - tol);
+    return Math.max(0, 100*(1 - t));
+  }
+
+  // Sample points along an SVG path uniformly by length
+  function samplePath(pathElem, n){
+    const len = pathElem.getTotalLength();
+    const samples = [];
+    for (let i=0;i<n;i++){
+      const p = pathElem.getPointAtLength((i/(n-1))*len);
+      samples.push({x:p.x, y:p.y});
+    }
+    return samples;
+  }
+
+  // Resample a polyline (array of points) to n equally spaced points by arclength
+  function resamplePolyline(pts, n){
+    // Compute cumulative lengths
+    const segs = [];
+    let total = 0;
+    for (let i=1;i<pts.length;i++){
+      const dx = pts[i].x - pts[i-1].x;
+      const dy = pts[i].y - pts[i-1].y;
+      const d = Math.hypot(dx, dy);
+      segs.push(d); total += d;
+    }
+    const samples = [];
+    if (total === 0) return Array(n).fill(pts[0]);
+    let target = 0;
+    let i = 0;
+    let acc = 0;
+    for (let k=0;k<n;k++){
+      target = (k/(n-1))*total;
+      while (acc + segs[i] < target && i < segs.length-1){
+        acc += segs[i]; i++;
+      }
+      const t = (target - acc) / (segs[i] || 1e-6);
+      const x = lerp(pts[i].x, pts[i+1].x, t);
+      const y = lerp(pts[i].y, pts[i+1].y, t);
+      samples.push({x,y});
+    }
+    return samples;
+  }
+
+  function lerp(a,b,t){ return a + (b-a)*t; }
+
+  // Nearest distance from a point to a polyline (piecewise-linear)
+  function pointToPolylineDist(p, poly){
+    let min = Infinity;
+    for (let i=1;i<poly.length;i++){
+      const d = pointToSegmentDist(p, poly[i-1], poly[i]);
+      if (d < min) min = d;
+    }
+    return min;
+  }
+  function pointToSegmentDist(p, a, b){
+    const vx = b.x - a.x, vy = b.y - a.y;
+    const wx = p.x - a.x, wy = p.y - a.y;
+    const c1 = vx*wx + vy*wy;
+    const c2 = vx*vx + vy*vy;
+    let t = c2 ? Math.max(0, Math.min(1, c1/c2)) : 0;
+    const px = a.x + t*vx, py = a.y + t*vy;
+  }
+})();
+</script>
+</body>
+</html>
